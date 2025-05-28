@@ -11,8 +11,8 @@ import re
 import numpy as np
 import sqlite3
 import shutil
-import threading # <-- เพิ่มไลบรารี threading
-import asyncio   # <-- เพิ่มไลบรารี asyncio สำหรับการเรียก async function ในเธรด
+import threading 
+import asyncio   
 
 # --- Constants and Configuration ---
 IMAGE_FOLDER = "image_folder"
@@ -145,42 +145,27 @@ def find_timestamp_roi(image):
     h, w, _ = image.shape
     rois = []
 
-    # 1. เดิม: ROI ตามมุมและขอบ (ค่อนข้างใหญ่)
-    rois.append((int(w * 0.5), int(h * 0.75), int(w * 0.5), int(h * 0.25))) # Bottom-Right (ใหญ่)
-    rois.append((0, int(h * 0.75), int(w * 0.5), int(h * 0.25)))           # Bottom-Left (ใหญ่)
-    rois.append((int(w * 0.5), 0, int(w * 0.5), int(h * 0.25)))             # Top-Right (ใหญ่)
-    rois.append((0, 0, int(w * 0.5), int(h * 0.25)))                       # Top-Left (ใหญ่)
+    
+    rois.append((int(w * 0.5), int(h * 0.75), int(w * 0.5), int(h * 0.25))) 
+    rois.append((0, int(h * 0.75), int(w * 0.5), int(h * 0.25)))           
+    rois.append((int(w * 0.5), 0, int(w * 0.5), int(h * 0.25)))             
+    rois.append((0, 0, int(w * 0.5), int(h * 0.25)))                       
 
-    # 2. เดิม: ROI ตามมุมและขอบ (เล็กลงหน่อย)
-    rois.append((int(w * 0.65), int(h * 0.85), int(w * 0.35), int(h * 0.15))) # Bottom-Right (เล็ก)
-    rois.append((0, int(h * 0.85), int(w * 0.35), int(h * 0.15)))           # Bottom-Left (เล็ก)
-    rois.append((int(w * 0.65), 0, int(w * 0.35), int(h * 0.15)))           # Top-Right (เล็ก)
-    rois.append((0, 0, int(w * 0.35), int(h * 0.15)))                       # Top-Left (เล็ก)
+    rois.append((int(w * 0.65), int(h * 0.85), int(w * 0.35), int(h * 0.15))) 
+    rois.append((0, int(h * 0.85), int(w * 0.35), int(h * 0.15)))           
+    rois.append((int(w * 0.65), 0, int(w * 0.35), int(h * 0.15)))          
+    rois.append((0, 0, int(w * 0.35), int(h * 0.15)))                       
 
-    # --- NEW: เพิ่ม ROI ที่ครอบคลุมพื้นที่กว้างขึ้น ---
+    rois.append((int(w * 0.25), int(h * 0.25), int(w * 0.5), int(h * 0.5))) 
 
-    # 3. ROI ตรงกลางภาพ (Central Region)
-    # ครอบคลุมประมาณ 50% ของความกว้างและความสูงจากกึ่งกลาง
-    rois.append((int(w * 0.25), int(h * 0.25), int(w * 0.5), int(h * 0.5))) # Center 50%
-
-    # 4. ROI กลางขอบด้านล่าง (Middle-Bottom Edge)
-    # ครอบคลุมความกว้างเกือบทั้งหมดที่ด้านล่าง แต่มีความสูงจำกัด
     rois.append((int(w * 0.1), int(h * 0.8), int(w * 0.8), int(h * 0.2)))
 
-    # 5. ROI กลางขอบด้านบน (Middle-Top Edge)
-    # ครอบคลุมความกว้างเกือบทั้งหมดที่ด้านบน แต่มีความสูงจำกัด
     rois.append((int(w * 0.1), 0, int(w * 0.8), int(h * 0.2)))
 
-    # 6. ROI กลางขอบด้านซ้าย (Middle-Left Edge)
-    # ครอบคลุมความสูงเกือบทั้งหมดที่ด้านซ้าย แต่มีความกว้างจำกัด
     rois.append((0, int(h * 0.1), int(w * 0.2), int(h * 0.8)))
 
-    # 7. ROI กลางขอบด้านขวา (Middle-Right Edge)
-    # ครอบคลุมความสูงเกือบทั้งหมดที่ด้านขวา แต่มีความกว้างจำกัด
     rois.append((int(w * 0.8), int(h * 0.1), int(w * 0.2), int(h * 0.8)))
 
-    # 8. ROI ครอบคลุมภาพเกือบทั้งหมด (เผื่อกรณี Timestamp มีขนาดใหญ่มาก หรืออยู่กระจัดกระจาย)
-    # อาจทำให้ OCR ใช้เวลานานขึ้น แต่ครอบคลุมสูงสุด
     rois.append((int(w * 0.05), int(h * 0.05), int(w * 0.9), int(h * 0.9)))
 
 
@@ -380,7 +365,7 @@ def process_photo_thread_target(loop, context, file_path, filename, username, bo
     except Exception as e:
         logging.error(f"[THREAD] 🔥 Error during image OCR for '{filename}': {e}")
     
-    # Data logging to Excel
+    
     try:
         wb = load_workbook(EXCEL_FILENAME)
         ws = wb["ImageMetadata"]
@@ -395,12 +380,10 @@ def process_photo_thread_target(loop, context, file_path, filename, username, bo
         else:
             reply_message += "ไม่พบเวลาในภาพ หรือไม่สามารถอ่านได้\n(ภาพถูกบันทึกในโฟลเดอร์ MLMISS เพื่อการตรวจสอบ)"
             
-        # Send reply message back to the user via the main event loop
-        # This ensures the async function (send_message) is called correctly.
+
         async def send_reply_async():
             await context.bot.send_message(chat_id=chat_id, text=reply_message)
         
-        # schedule the async coroutine to run on the main event loop
         asyncio.run_coroutine_threadsafe(send_reply_async(), loop)
 
     except Exception as e:
@@ -412,7 +395,6 @@ def process_photo_thread_target(loop, context, file_path, filename, username, bo
     logging.info(f"[THREAD] Finished processing for {filename}")
 
 
-# --- Bot Handler Functions ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
@@ -487,14 +469,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Start a new thread for OCR and data logging ---
-    # ส่ง asyncio event loop ของเธรดหลักไปด้วย เพื่อให้เธรดลูกสามารถส่งข้อความกลับได้
+    # - TODO*
+    # ส่ง asyncio event loop 
     current_loop = asyncio.get_event_loop()
     thread = threading.Thread(target=process_photo_thread_target, 
                               args=(current_loop, context, file_path, filename, username, bot_timestamp, chat_id))
     thread.start()
-    # thread.join() # ไม่ควรใส่ join() ตรงนี้ เพราะจะทำให้เธรดหลักถูกบล็อก
-
+    
 # --- Main Execution Block ---
 
 if __name__ == "__main__":
@@ -502,15 +483,13 @@ if __name__ == "__main__":
     
     initialize_directories()
     initialize_excel()
-    initialize_sqlite_db() # NEW: Initialize SQLite DB
+    initialize_sqlite_db() 
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # Add command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     
-    # Add photo message handler
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
     logging.info("Bot is ready to poll for updates.")
