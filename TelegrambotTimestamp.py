@@ -11,25 +11,21 @@ import re
 import numpy as np
 import sqlite3
 import shutil
-import threading 
-import asyncio   
+import threading
+import asyncio
 
-# --- Constants and Configuration ---
 IMAGE_FOLDER = "image_folder"
 EXCEL_FILENAME = "image_metadata.xlsx"
 ALLOWED_USERS_FILE = "User.txt"
 MAX_DAILY_IMAGES = 99999
-BOT_TOKEN = "Yourtoken" # BOT TOKEN ของคุณถูกใส่ไว้ตรงนี้แล้ว
+BOT_TOKEN = "ัyour token"
 
-# --- NEW: ML Feedback Folder & SQLite DB ---
-ML_MISS_FOLDER = "MLMISS"
+
 ML_FEEDBACK_DB = "ml_feedback.db"
 
-# --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Tesseract OCR Path Configuration ---
-tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe' # Default for Windows. Adjust as needed.
+tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 try:
     if os.path.exists(tesseract_cmd_path):
@@ -42,73 +38,45 @@ except pytesseract.TesseractNotFoundError:
 except Exception as e:
     logging.error(f"Error setting Tesseract path: {e}")
 
-
-# --- Define Date/Time Patterns and their Parsing Formats (OCR Logic - UNCHANGED) ---
 DATE_TIME_PATTERNS = [
-    # Pattern 1: DD-MM-YYYY HH:MM:SS (e.g., 23-05-2568 15:01:21, 23/05/2025 15:01:21)
     (r'(\d{2}[-./]\d{2}[-./]\d{4})\s+(\d{2}:\d{2}:\d{2})',
      ['%d-%m-%Y %H:%M:%S', '%d/%m/%Y %H:%M:%S', '%d.%m.%Y %H:%M:%S'],
      lambda d, t: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
-
-    # Pattern 2: DD-MM-YYYY HH:MM (no seconds)
     (r'(\d{2}[-./]\d{2}[-./]\d{4})\s+(\d{2}:\d{2})',
      ['%d-%m-%Y %H:%M', '%d/%m/%Y %H:%M', '%d.%m.%Y %H:%M'],
      lambda d, t: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
-
-    # Pattern 3: YYYY-MM-DD HH:MM:SS (e.g., 2025-05-23 15:01:21)
     (r'(\d{4}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2}:\d{2})',
      ['%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S', '%Y.%m.%d %H:%M:%S'],
      lambda d, t: f"{d} {t}"),
-
-    # Pattern 4: YYYY-MM-DD HH:MM (no seconds)
     (r'(\d{4}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2})',
      ['%Y-%m-%d %H:%M', '%Y/%m/%d %H:%M', '%Y.%m-%d %H:%M'],
      lambda d, t: f"{d} {t}"),
-
-    # Pattern 5: MM/DD/YYYY HH:MM:SS (US format)
     (r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})', ['%m/%d/%Y %H:%M:%S'], lambda d, t: f"{d} {t}"),
-
-    # Pattern 6: DD-MM-YY HH:MM:SS (2-digit year) - Assumes AD for 2-digit year
     (r'(\d{2}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2}:\d{2})',
      ['%d-%m-%y %H:%M:%S', '%d/%m/%y %H:%M:%S', '%d.%m.%y %H:%M:%S'],
      lambda d, t: f"{d} {t}"),
-
-    # Pattern 7: DD-MM-YY HH:MM (2-digit year, no seconds)
     (r'(\d{2}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2})',
      ['%d-%m-%y %H:%M', '%d/%m/%y %H:%M', '%d.%m.%y %H:%M'],
      lambda d, t: f"{d} {t}"),
-
-    # Pattern 8: HH:MM:SS DD-MM-YYYY (time first)
     (r'(\d{2}:\d{2}:\d{2})\s+(\d{2}[-./]\d{2}[-./]\d{4})',
-     ['%H:%M:%S %d-%m-%Y', '%H:%M:%S %d/%m/%Y', '%H:%M:%S %d.%m.%Y'],
+     ['%H:%M:%S %d-%m-%Y', '%H:%M:%S %d/%m-%Y', '%H:%M:%S %d.%m.%Y'],
      lambda t, d: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
-
-    # Pattern 9: DD Mon YYYY HH:MM:SS (e.g., 23 May 2025 15:01:21) - Requires setting locale if Thai month abbreviations used
     (r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s+\d{2}:\d{2}:\d{2})',
      ['%d %b %Y %H:%M:%S'], lambda s: s),
-
-    # Pattern 10: DD/MM/YY HH:MM AM/PM (e.g., 23/05/25 03:01 PM)
     (r'(\d{2}[-./]\d{2}[-./]\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M)',
      ['%d/%m/%y %I:%M %p', '%d/%m/%y %I:%M:%S %p', '%d-%m-%y %I:%M %p', '%d-%m-%y %I:%M:%S %p'],
      lambda s: s),
-
-    # Pattern 11: YYYY-MM-DDTHH:MM:SS (ISO format, sometimes seen in logs)
     (r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', ['%Y-%m-%dT%H:%M:%S'], lambda s: s),
-
-    # Pattern 12: Thai specific (e.g., "23 พ.ค. 2568 15:01:21")
     (r'(\d{1,2})\s+(พ\.ค\.)\s+(\d{4})\s+(\d{2}:\d{2}:\d{2})',
      ['%d %b %Y %H:%M:%S'],
      lambda d, m, y, t: f"{d} {m.replace('พ.ค.', 'May')} {str(int(y) - 543 if int(y) > datetime.now().year + 50 else y)} {t}"),
-
-    # Pattern 13: Thai with 'เวลา' (e.g., "23/5/2568 เวลา 15:01 น.")
     (r'(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})\s+เวลา\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*น\.',
      ['%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d-%m-%Y %H:%M:%S', '%d-%m-%Y %H:%M'],
-     lambda d_str, t_str: f"{str(int(d_str[-4:]) - 543) if len(d_str) >= 4 and int(d_str[-4:]) > datetime.now().year + 50 else d_str[-4:]}{d_str[2:6]}{d_str[0:2]} {t_str}" if len(d_str) >= 4 and d_str[-4:].isdigit() else f"{d_str} {t_str}"
+     lambda d_str, t_str: f"{str(int(d_str[-4:]) - 543) if len(d_str) >= 4 and int(d_str[-4:]) > datetime.now().year + 50 else d_str[-4:]}{d_str[2:6]}{d[0:2]} {t_str}" if len(d_str) >= 4 and d_str[-4:].isdigit() else f"{d_str} {t_str}"
     )
 ]
 
 def preprocess_image_for_ocr(image):
-    """Applies a series of image processing steps to enhance text for OCR."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced_gray = clahe.apply(gray)
@@ -136,46 +104,30 @@ def preprocess_image_for_ocr(image):
     denoised_image = cv2.erode(denoised_image, kernel_erode, iterations=1)
     return denoised_image
 
-
 def find_timestamp_roi(image):
-    """
-    Identifies potential regions of interest (ROI) where timestamps are typically located.
-    This version expands the search to include more central and mid-edge regions.
-    """
     h, w, _ = image.shape
     rois = []
 
-    
-    rois.append((int(w * 0.5), int(h * 0.75), int(w * 0.5), int(h * 0.25))) 
-    rois.append((0, int(h * 0.75), int(w * 0.5), int(h * 0.25)))           
-    rois.append((int(w * 0.5), 0, int(w * 0.5), int(h * 0.25)))             
-    rois.append((0, 0, int(w * 0.5), int(h * 0.25)))                       
+    rois.append((int(w * 0.5), int(h * 0.75), int(w * 0.5), int(h * 0.25)))
+    rois.append((0, int(h * 0.75), int(w * 0.5), int(h * 0.25)))
+    rois.append((int(w * 0.5), 0, int(w * 0.5), int(h * 0.25)))
+    rois.append((0, 0, int(w * 0.5), int(h * 0.25)))
 
-    rois.append((int(w * 0.65), int(h * 0.85), int(w * 0.35), int(h * 0.15))) 
-    rois.append((0, int(h * 0.85), int(w * 0.35), int(h * 0.15)))           
-    rois.append((int(w * 0.65), 0, int(w * 0.35), int(h * 0.15)))          
-    rois.append((0, 0, int(w * 0.35), int(h * 0.15)))                       
+    rois.append((int(w * 0.65), int(h * 0.85), int(w * 0.35), int(h * 0.15)))
+    rois.append((0, int(h * 0.85), int(w * 0.35), int(h * 0.15)))
+    rois.append((int(w * 0.65), 0, int(w * 0.35), int(h * 0.15)))
+    rois.append((0, 0, int(w * 0.35), int(h * 0.15)))
 
-    rois.append((int(w * 0.25), int(h * 0.25), int(w * 0.5), int(h * 0.5))) 
-
+    rois.append((int(w * 0.25), int(h * 0.25), int(w * 0.5), int(h * 0.5)))
     rois.append((int(w * 0.1), int(h * 0.8), int(w * 0.8), int(h * 0.2)))
-
     rois.append((int(w * 0.1), 0, int(w * 0.8), int(h * 0.2)))
-
     rois.append((0, int(h * 0.1), int(w * 0.2), int(h * 0.8)))
-
     rois.append((int(w * 0.8), int(h * 0.1), int(w * 0.2), int(h * 0.8)))
-
     rois.append((int(w * 0.05), int(h * 0.05), int(w * 0.9), int(h * 0.9)))
-
 
     return rois
 
 def extract_timestamp_from_image_ocr(image_path):
-    """
-    Extracts timestamp from an image using OCR, trying multiple ROIs and regex patterns.
-    Returns a datetime object if found, otherwise None.
-    """
     logging.info(f"Attempting to extract timestamp from: {image_path}")
     
     try:
@@ -226,7 +178,7 @@ def extract_timestamp_from_image_ocr(image_path):
                                 if best_parsed_dt is None or parsed_dt < best_parsed_dt:
                                     best_parsed_dt = parsed_dt
                                     logging.info(f"Found and parsed timestamp: {best_parsed_dt} (from '{processed_str}') in ROI {i} with format {dt_format}")
-                                    return best_parsed_dt # Return the first successfully parsed valid timestamp
+                                    return best_parsed_dt
                                 
                         except ValueError:
                             continue
@@ -242,14 +194,10 @@ def extract_timestamp_from_image_ocr(image_path):
         logging.error(f"Error during timestamp extraction for {image_path}: {e}")
         return None
 
-
-# --- Initialization Functions ---
-
 def initialize_directories():
     os.makedirs(IMAGE_FOLDER, exist_ok=True)
-    os.makedirs(ML_MISS_FOLDER, exist_ok=True) # Ensure ML_MISS_FOLDER exists
+    # S
     logging.info(f"Directory '{IMAGE_FOLDER}' ensured to exist.")
-    logging.info(f"Directory '{ML_MISS_FOLDER}' ensured to exist.")
 
 def initialize_excel():
     sheet_name = "ImageMetadata"
@@ -323,7 +271,6 @@ def insert_missed_timestamp_record(image_filename, timestamp_from_bot):
         if conn:
             conn.close()
 
-
 def load_allowed_users(filename=ALLOWED_USERS_FILE):
     if not os.path.exists(filename):
         logging.warning(f"'{filename}' not found. No users will be allowed unless created.")
@@ -337,67 +284,53 @@ def load_allowed_users(filename=ALLOWED_USERS_FILE):
         logging.error(f"Error loading allowed users from '{filename}': {e}")
         return set()
 
-# --- NEW: Function to process photo in a separate thread ---
-# ต้องระวัง: ฟังก์ชันนี้จะถูกเรียกในเธรดแยก ทำให้ไม่สามารถใช้ `await` ได้โดยตรง
-# หากต้องการส่งข้อความกลับหาผู้ใช้จากเธรดนี้ ต้องใช้ `asyncio.run_coroutine_threadsafe`
-def process_photo_thread_target(loop, context, file_path, filename, username, bot_timestamp, chat_id):
-    """
-    Target function for the new thread to handle OCR and data logging.
-    """
-    logging.info(f"[THREAD] Starting processing for {filename} from {username}")
+def process_photo_thread_target(loop, context, file_path_no_filename, filename_with_suffix, username, bot_timestamp, chat_id):
+    logging.info(f"[THREAD] Starting processing for {filename_with_suffix} from {username}")
+    
+    full_image_path = os.path.join(file_path_no_filename, filename_with_suffix) # สร้าง full path ที่ถูกต้อง
     extracted_image_timestamp = None
+    
     try:
-        # OCR processing - this part can still be CPU-bound but frees up the main bot thread
-        extracted_image_timestamp = extract_timestamp_from_image_ocr(file_path)
+        extracted_image_timestamp = extract_timestamp_from_image_ocr(full_image_path)
 
         if extracted_image_timestamp:
             logging.info(f"[THREAD] 📸 Extracted Timestamp from image: {extracted_image_timestamp}")
         else:
-            logging.warning(f"[THREAD] ⚠️ Could not extract timestamp from image: {filename}. Copying to MLMISS and logging.")
-            ml_miss_file_path = os.path.join(ML_MISS_FOLDER, filename)
-            try:
-                shutil.copy(file_path, ml_miss_file_path)
-                logging.info(f"[THREAD] Copied '{filename}' to '{ML_MISS_FOLDER}'.")
-                insert_missed_timestamp_record(filename, bot_timestamp)
-            except Exception as copy_e:
-                logging.error(f"[THREAD] Error copying '{filename}' to MLMISS: {copy_e}")
+            logging.warning(f"[THREAD] ⚠️ Could not extract timestamp from image: {filename_with_suffix}. Logging to SQLite.")
+            # s
+            insert_missed_timestamp_record(filename_with_suffix, bot_timestamp)
 
     except Exception as e:
-        logging.error(f"[THREAD] 🔥 Error during image OCR for '{filename}': {e}")
-    
+        logging.error(f"[THREAD] 🔥 Error during image OCR for '{filename_with_suffix}': {e}")
     
     try:
         wb = load_workbook(EXCEL_FILENAME)
         ws = wb["ImageMetadata"]
-        ws.append([username, bot_timestamp, filename,
+        ws.append([username, bot_timestamp, filename_with_suffix,
                    extracted_image_timestamp.strftime("%Y-%m-%d %H:%M:%S") if extracted_image_timestamp else "N/A"])
         wb.save(EXCEL_FILENAME)
-        logging.info(f"[THREAD] ✅ Inserted record for '{filename}' into Excel.")
+        logging.info(f"✅ Inserted record for '{filename_with_suffix}' into Excel.")
 
-        reply_message = f"✅ บันทึกข้อมูลเรียบร้อยแล้ว\nชื่อไฟล์: {filename}\n"
+        reply_message = f"✅ บันทึกข้อมูลเรียบร้อยแล้ว\nชื่อไฟล์: {filename_with_suffix}\n"
         if extracted_image_timestamp:
             reply_message += f"เวลาในภาพ: {extracted_image_timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
         else:
-            reply_message += "ไม่พบเวลาในภาพ หรือไม่สามารถอ่านได้\n(ภาพถูกบันทึกในโฟลเดอร์ MLMISS เพื่อการตรวจสอบ)"
+            reply_message += "ไม่พบเวลาในภาพ หรือไม่สามารถอ่านได้\n(ข้อมูลถูกบันทึกในฐานข้อมูลเพื่อการตรวจสอบ)"
             
-
         async def send_reply_async():
             await context.bot.send_message(chat_id=chat_id, text=reply_message)
         
         asyncio.run_coroutine_threadsafe(send_reply_async(), loop)
 
     except Exception as e:
-        logging.error(f"[THREAD] ❌ Excel write error for '{filename}': {e}")
+        logging.error(f"[THREAD] ❌ Excel write error for '{filename_with_suffix}': {e}")
         async def send_error_reply_async():
             await context.bot.send_message(chat_id=chat_id, text="❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล")
         asyncio.run_coroutine_threadsafe(send_error_reply_async(), loop)
         
-    logging.info(f"[THREAD] Finished processing for {filename}")
-
-
+    logging.info(f"[THREAD] Finished processing for {filename_with_suffix}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command."""
     user = update.message.from_user
     await update.message.reply_text(
         f"สวัสดีครับ {user.first_name}!\n"
@@ -408,7 +341,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"User {user.username} (ID: {user.id}) issued /start command.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /help command."""
     await update.message.reply_text(
         "คำสั่งที่มี:\n"
         "/start - เริ่มต้นใช้งานบอท\n"
@@ -417,13 +349,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     logging.info(f"User {update.message.from_user.username} (ID: {update.message.from_user.id}) issued /help command.")
 
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info("📸 Received a photo message.")
     
     user = update.message.from_user
     username = user.username if user.username else str(user.id)
-    chat_id = update.message.chat_id # Get chat_id to send messages back from thread
+    chat_id = update.message.chat_id
     logging.info(f"👤 Photo from user: {username} (ID: {user.id})")
 
     allowed_users = load_allowed_users()
@@ -432,58 +363,63 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.warning(f"🚫 Unauthorized user tried to send image: {username}")
         return
 
-    photo = update.message.photo[-1] # Get the largest resolution photo
+    photo = update.message.photo[-1]
     
     now = datetime.now()
-    date_str = now.strftime("%m-%d-%Y")
-    base_filename = f"{username}-log{date_str}"
+    date_str = now.strftime("%Y-%m-%d") # Format วันที่ YYYY-MM-DD สำหรับชื่อโฟลเดอร์
+
+    # สร้างพาธสำหรับโฟลเดอร์ผู้ใช้และโฟลเดอร์วันที่
+    user_folder_path = os.path.join(IMAGE_FOLDER, username)
+    date_folder_path = os.path.join(user_folder_path, date_str)
+
+    # ตรวจสอบและสร้างโฟลเดอร์ถ้ายังไม่มี
+    os.makedirs(date_folder_path, exist_ok=True)
+    logging.info(f"Ensured directory exists: {date_folder_path}")
+
+    base_filename_prefix = f"{username}-log{date_str}"
     
-    filename = None
+    filename_with_suffix = None
     for i in range(1, MAX_DAILY_IMAGES + 1):
         suffix = f"{i:06}"
-        temp_filename = f"{base_filename}-{suffix}.jpg"
-        temp_file_path = os.path.join(IMAGE_FOLDER, temp_filename)
+        temp_filename = f"{base_filename_prefix}-{suffix}.jpg"
+        temp_file_path = os.path.join(date_folder_path, temp_filename) # พาธเต็มสำหรับบันทึกไฟล์
         if not os.path.exists(temp_file_path):
-            filename = temp_filename
+            filename_with_suffix = temp_filename
             break
     
-    if not filename:
+    if not filename_with_suffix:
         await update.message.reply_text(
                 f"❌ เก็บภาพไม่สำเร็จ: เกินจำนวนสูงสุด {MAX_DAILY_IMAGES} ภาพในวันเดียวกัน"
         )
         logging.error(f"Exceeded max daily images for {username} on {date_str}.")
         return
 
-    file_path = os.path.join(IMAGE_FOLDER, filename)
+    # file_path สำหรับ download_to_drive 
+    full_download_path = os.path.join(date_folder_path, filename_with_suffix)
     
     try:
         file_obj = await context.bot.get_file(photo.file_id)
-        await file_obj.download_to_drive(file_path)
-        logging.info(f"📥 Downloaded file to {file_path}")
-        # Send immediate feedback to the user
+        await file_obj.download_to_drive(full_download_path)
+        logging.info(f"📥 Downloaded file to {full_download_path}")
         await update.message.reply_text("ได้รับรูปภาพแล้ว กำลังประมวลผล...")
     except Exception as e:
-        logging.error(f"❌ Error downloading file '{filename}': {e}")
+        logging.error(f"❌ Error downloading file '{filename_with_suffix}': {e}")
         await update.message.reply_text("❌ โหลดภาพล้มเหลว")
         return
 
     bot_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # - TODO*
-    # ส่ง asyncio event loop 
     current_loop = asyncio.get_event_loop()
     thread = threading.Thread(target=process_photo_thread_target, 
-                              args=(current_loop, context, file_path, filename, username, bot_timestamp, chat_id))
+                              args=(current_loop, context, date_folder_path, filename_with_suffix, username, bot_timestamp, chat_id))
     thread.start()
-    
-# --- Main Execution Block ---
 
 if __name__ == "__main__":
     logging.info("Starting Telegram Bot...")
     
-    initialize_directories()
+    initialize_directories() # จะสร้างแค่ image_folder
     initialize_excel()
-    initialize_sqlite_db() 
+    initialize_sqlite_db()
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
