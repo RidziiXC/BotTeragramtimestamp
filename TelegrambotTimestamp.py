@@ -1,0 +1,517 @@
+import logging
+import os
+from datetime import datetime
+from openpyxl import Workbook, load_workbook
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
+import cv2
+import pytesseract
+from PIL import Image
+import re
+import numpy as np
+import sqlite3
+import shutil
+import threading # <-- เพิ่มไลบรารี threading
+import asyncio   # <-- เพิ่มไลบรารี asyncio สำหรับการเรียก async function ในเธรด
+
+# --- Constants and Configuration ---
+IMAGE_FOLDER = "image_folder"
+EXCEL_FILENAME = "image_metadata.xlsx"
+ALLOWED_USERS_FILE = "User.txt"
+MAX_DAILY_IMAGES = 99999
+BOT_TOKEN = "Yourtoken" # BOT TOKEN ของคุณถูกใส่ไว้ตรงนี้แล้ว
+
+# --- NEW: ML Feedback Folder & SQLite DB ---
+ML_MISS_FOLDER = "MLMISS"
+ML_FEEDBACK_DB = "ml_feedback.db"
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Tesseract OCR Path Configuration ---
+tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe' # Default for Windows. Adjust as needed.
+
+try:
+    if os.path.exists(tesseract_cmd_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd_path
+    else:
+        logging.warning(f"Tesseract executable not found at '{tesseract_cmd_path}'. Trying system PATH.")
+        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+except pytesseract.TesseractNotFoundError:
+    logging.error("Tesseract is not installed or not found in system PATH. OCR will not work.")
+except Exception as e:
+    logging.error(f"Error setting Tesseract path: {e}")
+
+
+# --- Define Date/Time Patterns and their Parsing Formats (OCR Logic - UNCHANGED) ---
+DATE_TIME_PATTERNS = [
+    # Pattern 1: DD-MM-YYYY HH:MM:SS (e.g., 23-05-2568 15:01:21, 23/05/2025 15:01:21)
+    (r'(\d{2}[-./]\d{2}[-./]\d{4})\s+(\d{2}:\d{2}:\d{2})',
+     ['%d-%m-%Y %H:%M:%S', '%d/%m/%Y %H:%M:%S', '%d.%m.%Y %H:%M:%S'],
+     lambda d, t: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
+
+    # Pattern 2: DD-MM-YYYY HH:MM (no seconds)
+    (r'(\d{2}[-./]\d{2}[-./]\d{4})\s+(\d{2}:\d{2})',
+     ['%d-%m-%Y %H:%M', '%d/%m/%Y %H:%M', '%d.%m.%Y %H:%M'],
+     lambda d, t: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
+
+    # Pattern 3: YYYY-MM-DD HH:MM:SS (e.g., 2025-05-23 15:01:21)
+    (r'(\d{4}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2}:\d{2})',
+     ['%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S', '%Y.%m.%d %H:%M:%S'],
+     lambda d, t: f"{d} {t}"),
+
+    # Pattern 4: YYYY-MM-DD HH:MM (no seconds)
+    (r'(\d{4}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2})',
+     ['%Y-%m-%d %H:%M', '%Y/%m/%d %H:%M', '%Y.%m-%d %H:%M'],
+     lambda d, t: f"{d} {t}"),
+
+    # Pattern 5: MM/DD/YYYY HH:MM:SS (US format)
+    (r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2}:\d{2})', ['%m/%d/%Y %H:%M:%S'], lambda d, t: f"{d} {t}"),
+
+    # Pattern 6: DD-MM-YY HH:MM:SS (2-digit year) - Assumes AD for 2-digit year
+    (r'(\d{2}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2}:\d{2})',
+     ['%d-%m-%y %H:%M:%S', '%d/%m/%y %H:%M:%S', '%d.%m.%y %H:%M:%S'],
+     lambda d, t: f"{d} {t}"),
+
+    # Pattern 7: DD-MM-YY HH:MM (2-digit year, no seconds)
+    (r'(\d{2}[-./]\d{2}[-./]\d{2})\s+(\d{2}:\d{2})',
+     ['%d-%m-%y %H:%M', '%d/%m/%y %H:%M', '%d.%m.%y %H:%M'],
+     lambda d, t: f"{d} {t}"),
+
+    # Pattern 8: HH:MM:SS DD-MM-YYYY (time first)
+    (r'(\d{2}:\d{2}:\d{2})\s+(\d{2}[-./]\d{2}[-./]\d{4})',
+     ['%H:%M:%S %d-%m-%Y', '%H:%M:%S %d/%m/%Y', '%H:%M:%S %d.%m.%Y'],
+     lambda t, d: f"{str(int(d[6:10]) - 543) if int(d[6:10]) > datetime.now().year + 50 and len(d) == 10 and d[6:10].isdigit() else d[6:10]}{d[2:6]}{d[0:2]} {t}"),
+
+    # Pattern 9: DD Mon YYYY HH:MM:SS (e.g., 23 May 2025 15:01:21) - Requires setting locale if Thai month abbreviations used
+    (r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s+\d{2}:\d{2}:\d{2})',
+     ['%d %b %Y %H:%M:%S'], lambda s: s),
+
+    # Pattern 10: DD/MM/YY HH:MM AM/PM (e.g., 23/05/25 03:01 PM)
+    (r'(\d{2}[-./]\d{2}[-./]\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M)',
+     ['%d/%m/%y %I:%M %p', '%d/%m/%y %I:%M:%S %p', '%d-%m-%y %I:%M %p', '%d-%m-%y %I:%M:%S %p'],
+     lambda s: s),
+
+    # Pattern 11: YYYY-MM-DDTHH:MM:SS (ISO format, sometimes seen in logs)
+    (r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', ['%Y-%m-%dT%H:%M:%S'], lambda s: s),
+
+    # Pattern 12: Thai specific (e.g., "23 พ.ค. 2568 15:01:21")
+    (r'(\d{1,2})\s+(พ\.ค\.)\s+(\d{4})\s+(\d{2}:\d{2}:\d{2})',
+     ['%d %b %Y %H:%M:%S'],
+     lambda d, m, y, t: f"{d} {m.replace('พ.ค.', 'May')} {str(int(y) - 543 if int(y) > datetime.now().year + 50 else y)} {t}"),
+
+    # Pattern 13: Thai with 'เวลา' (e.g., "23/5/2568 เวลา 15:01 น.")
+    (r'(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})\s+เวลา\s+(\d{1,2}:\d{2}(?::\d{2})?)\s*น\.',
+     ['%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d-%m-%Y %H:%M:%S', '%d-%m-%Y %H:%M'],
+     lambda d_str, t_str: f"{str(int(d_str[-4:]) - 543) if len(d_str) >= 4 and int(d_str[-4:]) > datetime.now().year + 50 else d_str[-4:]}{d_str[2:6]}{d_str[0:2]} {t_str}" if len(d_str) >= 4 and d_str[-4:].isdigit() else f"{d_str} {t_str}"
+    )
+]
+
+def preprocess_image_for_ocr(image):
+    """Applies a series of image processing steps to enhance text for OCR."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced_gray = clahe.apply(gray)
+    blurred_image = cv2.GaussianBlur(enhanced_gray, (3, 3), 0)
+    thresh_image = cv2.adaptiveThreshold(blurred_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY_INV, 15, 5)
+
+    coords = np.column_stack(np.where(thresh_image > 0))
+    if coords.size > 0:
+        rect = cv2.minAreaRect(coords)
+        angle = rect[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = thresh_image.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        thresh_image = cv2.warpAffine(thresh_image, M, (w, h),
+                                      flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    kernel_dilate = np.ones((1,1), np.uint8)
+    kernel_erode = np.ones((1,1), np.uint8)
+    denoised_image = cv2.dilate(thresh_image, kernel_dilate, iterations=1)
+    denoised_image = cv2.erode(denoised_image, kernel_erode, iterations=1)
+    return denoised_image
+
+
+def find_timestamp_roi(image):
+    """
+    Identifies potential regions of interest (ROI) where timestamps are typically located.
+    This version expands the search to include more central and mid-edge regions.
+    """
+    h, w, _ = image.shape
+    rois = []
+
+    # 1. เดิม: ROI ตามมุมและขอบ (ค่อนข้างใหญ่)
+    rois.append((int(w * 0.5), int(h * 0.75), int(w * 0.5), int(h * 0.25))) # Bottom-Right (ใหญ่)
+    rois.append((0, int(h * 0.75), int(w * 0.5), int(h * 0.25)))           # Bottom-Left (ใหญ่)
+    rois.append((int(w * 0.5), 0, int(w * 0.5), int(h * 0.25)))             # Top-Right (ใหญ่)
+    rois.append((0, 0, int(w * 0.5), int(h * 0.25)))                       # Top-Left (ใหญ่)
+
+    # 2. เดิม: ROI ตามมุมและขอบ (เล็กลงหน่อย)
+    rois.append((int(w * 0.65), int(h * 0.85), int(w * 0.35), int(h * 0.15))) # Bottom-Right (เล็ก)
+    rois.append((0, int(h * 0.85), int(w * 0.35), int(h * 0.15)))           # Bottom-Left (เล็ก)
+    rois.append((int(w * 0.65), 0, int(w * 0.35), int(h * 0.15)))           # Top-Right (เล็ก)
+    rois.append((0, 0, int(w * 0.35), int(h * 0.15)))                       # Top-Left (เล็ก)
+
+    # --- NEW: เพิ่ม ROI ที่ครอบคลุมพื้นที่กว้างขึ้น ---
+
+    # 3. ROI ตรงกลางภาพ (Central Region)
+    # ครอบคลุมประมาณ 50% ของความกว้างและความสูงจากกึ่งกลาง
+    rois.append((int(w * 0.25), int(h * 0.25), int(w * 0.5), int(h * 0.5))) # Center 50%
+
+    # 4. ROI กลางขอบด้านล่าง (Middle-Bottom Edge)
+    # ครอบคลุมความกว้างเกือบทั้งหมดที่ด้านล่าง แต่มีความสูงจำกัด
+    rois.append((int(w * 0.1), int(h * 0.8), int(w * 0.8), int(h * 0.2)))
+
+    # 5. ROI กลางขอบด้านบน (Middle-Top Edge)
+    # ครอบคลุมความกว้างเกือบทั้งหมดที่ด้านบน แต่มีความสูงจำกัด
+    rois.append((int(w * 0.1), 0, int(w * 0.8), int(h * 0.2)))
+
+    # 6. ROI กลางขอบด้านซ้าย (Middle-Left Edge)
+    # ครอบคลุมความสูงเกือบทั้งหมดที่ด้านซ้าย แต่มีความกว้างจำกัด
+    rois.append((0, int(h * 0.1), int(w * 0.2), int(h * 0.8)))
+
+    # 7. ROI กลางขอบด้านขวา (Middle-Right Edge)
+    # ครอบคลุมความสูงเกือบทั้งหมดที่ด้านขวา แต่มีความกว้างจำกัด
+    rois.append((int(w * 0.8), int(h * 0.1), int(w * 0.2), int(h * 0.8)))
+
+    # 8. ROI ครอบคลุมภาพเกือบทั้งหมด (เผื่อกรณี Timestamp มีขนาดใหญ่มาก หรืออยู่กระจัดกระจาย)
+    # อาจทำให้ OCR ใช้เวลานานขึ้น แต่ครอบคลุมสูงสุด
+    rois.append((int(w * 0.05), int(h * 0.05), int(w * 0.9), int(h * 0.9)))
+
+
+    return rois
+
+def extract_timestamp_from_image_ocr(image_path):
+    """
+    Extracts timestamp from an image using OCR, trying multiple ROIs and regex patterns.
+    Returns a datetime object if found, otherwise None.
+    """
+    logging.info(f"Attempting to extract timestamp from: {image_path}")
+    
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            logging.error(f"Could not load image: {image_path}")
+            return None
+
+        potential_rois = find_timestamp_roi(img)
+        best_parsed_dt = None
+
+        for i, (x_start, y_start, roi_width, roi_height) in enumerate(potential_rois):
+            x_end = min(x_start + roi_width, img.shape[1])
+            y_end = min(y_start + roi_height, img.shape[0])
+            
+            if x_start >= x_end or y_start >= y_end:
+                continue
+
+            current_roi = img[y_start:y_end, x_start:x_end]
+            if current_roi.shape[0] == 0 or current_roi.shape[1] == 0:
+                continue
+
+            processed_roi = preprocess_image_for_ocr(current_roi)
+            pil_img_roi = Image.fromarray(processed_roi)
+
+            tess_config_base = '--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789-:/,. '
+            extracted_text = pytesseract.image_to_string(pil_img_roi, lang='eng', config=tess_config_base).strip()
+            
+            if not extracted_text or not any(c.isdigit() for c in extracted_text):
+                tess_config_fallback = '--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789-:/,.พคกบวศจภลยชซฐณตถนปผฝฟมยรฤลฬอสอหฮะัาิวีึืุูเแไใโ์็่้๊๋์ๆฯะำเเโใไ '
+                extracted_text = pytesseract.image_to_string(pil_img_roi, lang='tha+eng', config=tess_config_fallback).strip()
+
+            logging.debug(f"ROI ({x_start},{y_start},{x_end},{y_end}) - Extracted text: '{extracted_text}'")
+
+            for regex_pattern, datetime_formats, preprocess_func in DATE_TIME_PATTERNS:
+                match = re.search(regex_pattern, extracted_text)
+                if match:
+                    matched_groups = [group.strip() for group in match.groups() if group is not None]
+                    processed_str = preprocess_func(*matched_groups) if preprocess_func else " ".join(matched_groups)
+                    
+                    logging.debug(f"Attempting to parse '{processed_str}' with regex: {regex_pattern}")
+
+                    for dt_format in datetime_formats:
+                        try:
+                            parsed_dt = datetime.strptime(processed_str, dt_format)
+                            current_time = datetime.now()
+                            if abs((current_time - parsed_dt).days) < 365 * 10 or parsed_dt.year > current_time.year + 5:
+                                if best_parsed_dt is None or parsed_dt < best_parsed_dt:
+                                    best_parsed_dt = parsed_dt
+                                    logging.info(f"Found and parsed timestamp: {best_parsed_dt} (from '{processed_str}') in ROI {i} with format {dt_format}")
+                                    return best_parsed_dt # Return the first successfully parsed valid timestamp
+                                
+                        except ValueError:
+                            continue
+
+        if best_parsed_dt:
+            logging.info(f"Final best timestamp found for {image_path}: {best_parsed_dt}")
+            return best_parsed_dt
+        else:
+            logging.warning(f"No valid timestamp found in any ROI or with any pattern for {image_path}.")
+            return None
+
+    except Exception as e:
+        logging.error(f"Error during timestamp extraction for {image_path}: {e}")
+        return None
+
+
+# --- Initialization Functions ---
+
+def initialize_directories():
+    os.makedirs(IMAGE_FOLDER, exist_ok=True)
+    os.makedirs(ML_MISS_FOLDER, exist_ok=True) # Ensure ML_MISS_FOLDER exists
+    logging.info(f"Directory '{IMAGE_FOLDER}' ensured to exist.")
+    logging.info(f"Directory '{ML_MISS_FOLDER}' ensured to exist.")
+
+def initialize_excel():
+    sheet_name = "ImageMetadata"
+    if not os.path.exists(EXCEL_FILENAME):
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = sheet_name
+            ws.append(["ID (username)", "Bot Timestamp", "Image Log Name", "Extracted Image Timestamp"])
+            wb.save(EXCEL_FILENAME)
+            logging.info(f"New Excel file '{EXCEL_FILENAME}' created with '{sheet_name}' sheet and headers.")
+        except Exception as e:
+            logging.error(f"Failed to create Excel file '{EXCEL_FILENAME}': {e}")
+    else:
+        try:
+            wb = load_workbook(EXCEL_FILENAME)
+            if sheet_name not in wb.sheetnames:
+                ws = wb.create_sheet(sheet_name)
+                ws.append(["ID (username)", "Bot Timestamp", "Image Log Name", "Extracted Image Timestamp"])
+                logging.info(f"Created new sheet '{sheet_name}' in '{EXCEL_FILENAME}' with headers.")
+            else:
+                ws = wb[sheet_name]
+                headers = [cell.value for cell in ws[1]]
+                if "Extracted Image Timestamp" not in headers:
+                    ws.cell(row=1, column=len(headers) + 1, value="Extracted Image Timestamp")
+                    logging.info(f"Added 'Extracted Image Timestamp' column to '{sheet_name}' in '{EXCEL_FILENAME}'.")
+            wb.save(EXCEL_FILENAME)
+        except Exception as e:
+            logging.warning(f"Could not initialize sheet '{sheet_name}' in '{EXCEL_FILENAME}': {e}")
+
+def initialize_sqlite_db():
+    conn = None
+    try:
+        conn = sqlite3.connect(ML_FEEDBACK_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS missed_timestamps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_filename TEXT NOT NULL UNIQUE,
+                timestamp_from_bot TEXT NOT NULL,
+                ml_correct_timestamp TEXT,
+                notes TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        logging.info(f"SQLite database '{ML_FEEDBACK_DB}' and table 'missed_timestamps' initialized.")
+    except sqlite3.Error as e:
+        logging.error(f"Error initializing SQLite database: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def insert_missed_timestamp_record(image_filename, timestamp_from_bot):
+    conn = None
+    try:
+        conn = sqlite3.connect(ML_FEEDBACK_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR IGNORE INTO missed_timestamps (image_filename, timestamp_from_bot)
+            VALUES (?, ?)
+        ''', (image_filename, timestamp_from_bot))
+        conn.commit()
+        if cursor.rowcount > 0:
+            logging.info(f"Inserted missed timestamp record for '{image_filename}' into SQLite.")
+        else:
+            logging.info(f"Record for '{image_filename}' already exists in SQLite (ignored).")
+    except sqlite3.Error as e:
+        logging.error(f"Error inserting into missed_timestamps: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_allowed_users(filename=ALLOWED_USERS_FILE):
+    if not os.path.exists(filename):
+        logging.warning(f"'{filename}' not found. No users will be allowed unless created.")
+        return set()
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            allowed_users = {line.strip().lower() for line in f if line.strip()}
+        logging.info(f"Loaded {len(allowed_users)} allowed users from '{filename}'.")
+        return allowed_users
+    except Exception as e:
+        logging.error(f"Error loading allowed users from '{filename}': {e}")
+        return set()
+
+# --- NEW: Function to process photo in a separate thread ---
+# ต้องระวัง: ฟังก์ชันนี้จะถูกเรียกในเธรดแยก ทำให้ไม่สามารถใช้ `await` ได้โดยตรง
+# หากต้องการส่งข้อความกลับหาผู้ใช้จากเธรดนี้ ต้องใช้ `asyncio.run_coroutine_threadsafe`
+def process_photo_thread_target(loop, context, file_path, filename, username, bot_timestamp, chat_id):
+    """
+    Target function for the new thread to handle OCR and data logging.
+    """
+    logging.info(f"[THREAD] Starting processing for {filename} from {username}")
+    extracted_image_timestamp = None
+    try:
+        # OCR processing - this part can still be CPU-bound but frees up the main bot thread
+        extracted_image_timestamp = extract_timestamp_from_image_ocr(file_path)
+
+        if extracted_image_timestamp:
+            logging.info(f"[THREAD] 📸 Extracted Timestamp from image: {extracted_image_timestamp}")
+        else:
+            logging.warning(f"[THREAD] ⚠️ Could not extract timestamp from image: {filename}. Copying to MLMISS and logging.")
+            ml_miss_file_path = os.path.join(ML_MISS_FOLDER, filename)
+            try:
+                shutil.copy(file_path, ml_miss_file_path)
+                logging.info(f"[THREAD] Copied '{filename}' to '{ML_MISS_FOLDER}'.")
+                insert_missed_timestamp_record(filename, bot_timestamp)
+            except Exception as copy_e:
+                logging.error(f"[THREAD] Error copying '{filename}' to MLMISS: {copy_e}")
+
+    except Exception as e:
+        logging.error(f"[THREAD] 🔥 Error during image OCR for '{filename}': {e}")
+    
+    # Data logging to Excel
+    try:
+        wb = load_workbook(EXCEL_FILENAME)
+        ws = wb["ImageMetadata"]
+        ws.append([username, bot_timestamp, filename,
+                   extracted_image_timestamp.strftime("%Y-%m-%d %H:%M:%S") if extracted_image_timestamp else "N/A"])
+        wb.save(EXCEL_FILENAME)
+        logging.info(f"[THREAD] ✅ Inserted record for '{filename}' into Excel.")
+
+        reply_message = f"✅ บันทึกข้อมูลเรียบร้อยแล้ว\nชื่อไฟล์: {filename}\n"
+        if extracted_image_timestamp:
+            reply_message += f"เวลาในภาพ: {extracted_image_timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        else:
+            reply_message += "ไม่พบเวลาในภาพ หรือไม่สามารถอ่านได้\n(ภาพถูกบันทึกในโฟลเดอร์ MLMISS เพื่อการตรวจสอบ)"
+            
+        # Send reply message back to the user via the main event loop
+        # This ensures the async function (send_message) is called correctly.
+        async def send_reply_async():
+            await context.bot.send_message(chat_id=chat_id, text=reply_message)
+        
+        # schedule the async coroutine to run on the main event loop
+        asyncio.run_coroutine_threadsafe(send_reply_async(), loop)
+
+    except Exception as e:
+        logging.error(f"[THREAD] ❌ Excel write error for '{filename}': {e}")
+        async def send_error_reply_async():
+            await context.bot.send_message(chat_id=chat_id, text="❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล")
+        asyncio.run_coroutine_threadsafe(send_error_reply_async(), loop)
+        
+    logging.info(f"[THREAD] Finished processing for {filename}")
+
+
+# --- Bot Handler Functions ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    user = update.message.from_user
+    await update.message.reply_text(
+        f"สวัสดีครับ {user.first_name}!\n"
+        "บอทนี้ใช้สำหรับรับภาพและบันทึกข้อมูล Timestamp\n"
+        "คุณสามารถส่งรูปภาพมาได้เลย (หากได้รับอนุญาต)\n"
+        "ใช้ /help เพื่อดูคำสั่งเพิ่มเติม"
+    )
+    logging.info(f"User {user.username} (ID: {user.id}) issued /start command.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /help command."""
+    await update.message.reply_text(
+        "คำสั่งที่มี:\n"
+        "/start - เริ่มต้นใช้งานบอท\n"
+        "/help - แสดงคำสั่งนี้\n"
+        "คุณสามารถส่งรูปภาพที่มี Timestamp เพื่อให้บอทประมวลผลได้"
+    )
+    logging.info(f"User {update.message.from_user.username} (ID: {update.message.from_user.id}) issued /help command.")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("📸 Received a photo message.")
+    
+    user = update.message.from_user
+    username = user.username if user.username else str(user.id)
+    chat_id = update.message.chat_id # Get chat_id to send messages back from thread
+    logging.info(f"👤 Photo from user: {username} (ID: {user.id})")
+
+    allowed_users = load_allowed_users()
+    if username.lower() not in allowed_users:
+        await update.message.reply_text("❌ คุณไม่ได้รับอนุญาตให้ส่งภาพเข้าเก็บระบบ")
+        logging.warning(f"🚫 Unauthorized user tried to send image: {username}")
+        return
+
+    photo = update.message.photo[-1] # Get the largest resolution photo
+    
+    now = datetime.now()
+    date_str = now.strftime("%m-%d-%Y")
+    base_filename = f"{username}-log{date_str}"
+    
+    filename = None
+    for i in range(1, MAX_DAILY_IMAGES + 1):
+        suffix = f"{i:06}"
+        temp_filename = f"{base_filename}-{suffix}.jpg"
+        temp_file_path = os.path.join(IMAGE_FOLDER, temp_filename)
+        if not os.path.exists(temp_file_path):
+            filename = temp_filename
+            break
+    
+    if not filename:
+        await update.message.reply_text(
+                f"❌ เก็บภาพไม่สำเร็จ: เกินจำนวนสูงสุด {MAX_DAILY_IMAGES} ภาพในวันเดียวกัน"
+        )
+        logging.error(f"Exceeded max daily images for {username} on {date_str}.")
+        return
+
+    file_path = os.path.join(IMAGE_FOLDER, filename)
+    
+    try:
+        file_obj = await context.bot.get_file(photo.file_id)
+        await file_obj.download_to_drive(file_path)
+        logging.info(f"📥 Downloaded file to {file_path}")
+        # Send immediate feedback to the user
+        await update.message.reply_text("ได้รับรูปภาพแล้ว กำลังประมวลผล...")
+    except Exception as e:
+        logging.error(f"❌ Error downloading file '{filename}': {e}")
+        await update.message.reply_text("❌ โหลดภาพล้มเหลว")
+        return
+
+    bot_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # --- Start a new thread for OCR and data logging ---
+    # ส่ง asyncio event loop ของเธรดหลักไปด้วย เพื่อให้เธรดลูกสามารถส่งข้อความกลับได้
+    current_loop = asyncio.get_event_loop()
+    thread = threading.Thread(target=process_photo_thread_target, 
+                              args=(current_loop, context, file_path, filename, username, bot_timestamp, chat_id))
+    thread.start()
+    # thread.join() # ไม่ควรใส่ join() ตรงนี้ เพราะจะทำให้เธรดหลักถูกบล็อก
+
+# --- Main Execution Block ---
+
+if __name__ == "__main__":
+    logging.info("Starting Telegram Bot...")
+    
+    initialize_directories()
+    initialize_excel()
+    initialize_sqlite_db() # NEW: Initialize SQLite DB
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    
+    # Add photo message handler
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
+    logging.info("Bot is ready to poll for updates.")
+    application.run_polling()
