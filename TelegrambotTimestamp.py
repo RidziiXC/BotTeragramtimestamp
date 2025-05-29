@@ -4,35 +4,36 @@ from datetime import datetime
 from openpyxl import Workbook, load_workbook
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
-import cv2
-import pytesseract
-from PIL import Image
+import cv2 
+import pytesseract 
+from PIL import Image 
 import re
-import numpy as np
+import numpy as np 
 import sqlite3
 import shutil
 import threading
 import asyncio
+import glob
+
+# --- Import Modules ---
+import logging_manager
+import excel_manager
+import resume_manager
 
 # --- Constants and Configuration ---
 IMAGE_FOLDER = "image_folder"
-EXCEL_FILENAME = "image_metadata.xlsx"
 ALLOWED_USERS_FILE = "User.txt"
 MAX_DAILY_IMAGES = 99999
-BOT_TOKEN = "7810837728:AAHTW70rIspyZfCdW8KBVXYkPC5lkbIUafQ"
+BOT_TOKEN = "" # BOT TOKEN ของคุณถูกใส่ไว้ตรงนี้แล้ว
 
 ML_FEEDBACK_DB = "ml_feedback.db"
 LOG_FILENAME = "bot_activity.log"
 
+# --- Excel Files Configuration ---
+EXCEL_BASE_FOLDER = "Excel Files" # โฟลเดอร์สำหรับเก็บไฟล์ Excel ในเครื่อง
+
 # --- Setup Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+logging_manager.setup_logging(log_filename=LOG_FILENAME)
 
 tesseract_cmd_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
@@ -85,6 +86,7 @@ DATE_TIME_PATTERNS = [
     )
 ]
 
+# --- #OCR-related functions #
 def preprocess_image_for_ocr(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -137,104 +139,16 @@ def find_timestamp_roi(image):
     return rois
 
 def extract_timestamp_from_image_ocr(image_path):
-    logging.info(f"Attempting to extract timestamp from: {image_path}")
-    
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            logging.error(f"Could not load image: {image_path}")
-            return None
+    # TODO
+    logging.info(f"Attempting to extract timestamp from: {image_path} (OCR is disabled).")
+    return None # Return None เพราะ OCR ถูกปิดการใช้งาน
 
-        potential_rois = find_timestamp_roi(img)
-        best_parsed_dt = None
-
-        for i, (x_start, y_start, roi_width, roi_height) in enumerate(potential_rois):
-            x_end = min(x_start + roi_width, img.shape[1])
-            y_end = min(y_start + roi_height, img.shape[0])
-            
-            if x_start >= x_end or y_start >= y_end:
-                continue
-
-            current_roi = img[y_start:y_end, x_start:x_end]
-            if current_roi.shape[0] == 0 or current_roi.shape[1] == 0:
-                continue
-
-            processed_roi = preprocess_image_for_ocr(current_roi)
-            pil_img_roi = Image.fromarray(processed_roi)
-
-            tess_config_base = '--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789-:/,. '
-            extracted_text = pytesseract.image_to_string(pil_img_roi, lang='eng', config=tess_config_base).strip()
-            
-            if not extracted_text or not any(c.isdigit() for c in extracted_text):
-                tess_config_fallback = '--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789-:/,.พคกบวศจภลยชซฐณตถนปผฝฟมยรฤลฬอสอหฮะัาิวีึืุูเแไใโ์็่้๊๋์ๆฯะำเเโใไ '
-                extracted_text = pytesseract.image_to_string(pil_img_roi, lang='tha+eng', config=tess_config_fallback).strip()
-
-            logging.debug(f"ROI ({x_start},{y_start},{x_end},{y_end}) - Extracted text: '{extracted_text}'")
-
-            for regex_pattern, datetime_formats, preprocess_func in DATE_TIME_PATTERNS:
-                match = re.search(regex_pattern, extracted_text)
-                if match:
-                    matched_groups = [group.strip() for group in match.groups() if group is not None]
-                    processed_str = preprocess_func(*matched_groups) if preprocess_func else " ".join(matched_groups)
-                    
-                    logging.debug(f"Attempting to parse '{processed_str}' with regex: {regex_pattern}")
-
-                    for dt_format in datetime_formats:
-                        try:
-                            parsed_dt = datetime.strptime(processed_str, dt_format)
-                            current_time = datetime.now()
-                            if abs((current_time - parsed_dt).days) < 365 * 10 or parsed_dt.year > current_time.year + 5:
-                                if best_parsed_dt is None or parsed_dt < best_parsed_dt:
-                                    best_parsed_dt = parsed_dt
-                                    logging.info(f"Found and parsed timestamp: {best_parsed_dt} (from '{processed_str}') in ROI {i} with format {dt_format}")
-                                    return best_parsed_dt
-                                
-                        except ValueError:
-                            continue
-
-        if best_parsed_dt:
-            logging.info(f"Final best timestamp found for {image_path}: {best_parsed_dt}")
-            return best_parsed_dt
-        else:
-            logging.warning(f"No valid timestamp found in any ROI or with any pattern for {image_path}.")
-            return None
-
-    except Exception as e:
-        logging.error(f"Error during timestamp extraction for {image_path}: {e}")
-        return None
 
 def initialize_directories():
     os.makedirs(IMAGE_FOLDER, exist_ok=True)
+    os.makedirs(EXCEL_BASE_FOLDER, exist_ok=True)
     logging.info(f"Directory '{IMAGE_FOLDER}' ensured to exist.")
-
-def initialize_excel():
-    sheet_name = "ImageMetadata"
-    if not os.path.exists(EXCEL_FILENAME):
-        try:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = sheet_name
-            ws.append(["ID (username)", "Bot Timestamp", "Image Log Name", "Extracted Image Timestamp"])
-            wb.save(EXCEL_FILENAME)
-            logging.info(f"New Excel file '{EXCEL_FILENAME}' created with '{sheet_name}' sheet and headers.")
-        except Exception as e:
-            logging.error(f"Failed to create Excel file '{EXCEL_FILENAME}': {e}")
-    else:
-        try:
-            wb = load_workbook(EXCEL_FILENAME)
-            if sheet_name not in wb.sheetnames:
-                ws = wb.create_sheet(sheet_name)
-                ws.append(["ID (username)", "Bot Timestamp", "Image Log Name", "Extracted Image Timestamp"])
-                logging.info(f"Created new sheet '{sheet_name}' in '{EXCEL_FILENAME}' with headers.")
-            else:
-                ws = wb[sheet_name]
-                headers = [cell.value for cell in ws[1]]
-                if "Extracted Image Timestamp" not in headers:
-                    ws.cell(row=1, column=len(headers) + 1, value="Extracted Image Timestamp")
-                    logging.info(f"Added 'Extracted Image Timestamp' column to '{sheet_name}' in '{EXCEL_FILENAME}'.")
-            wb.save(EXCEL_FILENAME)
-        except Exception as e:
-            logging.warning(f"Could not initialize sheet '{sheet_name}' in '{EXCEL_FILENAME}': {e}")
+    logging.info(f"Directory '{EXCEL_BASE_FOLDER}' ensured to exist.")
 
 def initialize_sqlite_db():
     conn = None
@@ -292,46 +206,23 @@ def load_allowed_users(filename=ALLOWED_USERS_FILE):
         logging.error(f"Error loading allowed users from '{filename}': {e}")
         return set()
 
-# --- New Function: append_to_excel (ย้ายมาไว้ที่นี่เพื่อเรียกใช้ได้ง่าย) ---
-def append_to_excel(username, bot_timestamp, filename, extracted_image_timestamp_str):
-    try:
-        wb = load_workbook(EXCEL_FILENAME)
-        ws = wb["ImageMetadata"]
-        ws.append([username, bot_timestamp, filename, extracted_image_timestamp_str])
-        wb.save(EXCEL_FILENAME)
-        logging.info(f"✅ Inserted record for '{filename}' into Excel.")
-    except Exception as e:
-        logging.error(f"❌ Excel write error for '{filename}': {e}")
-
-
+# --- Process Photo Thread Target (Main logic for saving, no OCR) ---
 def process_photo_thread_target(loop, bot_instance, file_path_no_filename, filename_with_suffix, username, bot_timestamp, chat_id):
     logging.info(f"[THREAD] Starting processing for {filename_with_suffix} from {username}")
     
-    full_image_path = os.path.join(file_path_no_filename, filename_with_suffix)
-    extracted_image_timestamp = None
+    full_image_path = os.path.join(file_path_no_filename, filename_with_suffix) 
+    extracted_image_timestamp = bot_timestamp # ใช้ bot_timestamp เป็น extracted_image_timestamp
     
     try:
-        extracted_image_timestamp = extract_timestamp_from_image_ocr(full_image_path)
-
-        if extracted_image_timestamp:
-            logging.info(f"[THREAD] 📸 Extracted Timestamp from image: {extracted_image_timestamp}")
-        else:
-            logging.warning(f"[THREAD] ⚠️ Could not extract timestamp from image: {filename_with_suffix}. Logging to SQLite.")
-            insert_missed_timestamp_record(filename_with_suffix, bot_timestamp)
-
-    except Exception as e:
-        logging.error(f"[THREAD] 🔥 Error during image OCR for '{filename_with_suffix}': {e}")
-    
-    try:
-        # ใช้ append_to_excel function ที่แยกไว้
-        append_to_excel(username, bot_timestamp, filename_with_suffix,
-                        extracted_image_timestamp.strftime("%Y-%m-%d %H:%M:%S") if extracted_image_timestamp else "N/A")
+        # Save data to local Excel only (Google Sheets integration removed)
+        excel_manager.append_to_local_excel(
+            username, bot_timestamp, filename_with_suffix, extracted_image_timestamp,
+            current_datetime=datetime.now(),
+            base_folder=EXCEL_BASE_FOLDER
+        )
 
         reply_message = f"✅ บันทึกข้อมูลเรียบร้อยแล้ว\nชื่อไฟล์: {filename_with_suffix}\n"
-        if extracted_image_timestamp:
-            reply_message += f"เวลาในภาพ: {extracted_image_timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-        else:
-            reply_message += "StatusN \n(ข้อมูลถูกบันทึกในฐานข้อมูลเพื่อการตรวจสอบ)"
+        reply_message += f"เวลาที่บันทึก: {extracted_image_timestamp}"
             
         async def send_reply_async():
             await bot_instance.send_message(chat_id=chat_id, text=reply_message)
@@ -339,13 +230,14 @@ def process_photo_thread_target(loop, bot_instance, file_path_no_filename, filen
         asyncio.run_coroutine_threadsafe(send_reply_async(), loop)
 
     except Exception as e:
-        logging.error(f"[THREAD] ❌ Excel write error for '{filename_with_suffix}': {e}")
+        logging.error(f"[THREAD] ❌ Error saving data for '{filename_with_suffix}': {e}")
         async def send_error_reply_async():
             await bot_instance.send_message(chat_id=chat_id, text="❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล")
         asyncio.run_coroutine_threadsafe(send_error_reply_async(), loop)
         
     logging.info(f"[THREAD] Finished processing for {filename_with_suffix}")
 
+# --- Bot Handler Functions ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     await update.message.reply_text(
@@ -423,98 +315,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
     current_loop = asyncio.get_event_loop()
-    # ส่ง application.bot ไปยังเธรด
     thread = threading.Thread(target=process_photo_thread_target, 
                               args=(current_loop, context.bot, date_folder_path, filename_with_suffix, username, bot_timestamp, chat_id))
     thread.start()
-
-# --- Resume Manager Logic (ย้ายมาไว้ที่นี่เพื่อความสะดวกในการรวมไฟล์) ---
-import glob # จำเป็นสำหรับ glob.glob
-
-def get_processed_image_filenames_for_resume(excel_filename_param):
-    processed_files = set()
-    try:
-        if os.path.exists(excel_filename_param):
-            wb = load_workbook(excel_filename_param)
-            ws = wb["ImageMetadata"]
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if row and len(row) > 2:
-                    processed_files.add(row[2])
-    except Exception as e:
-        logging.error(f"Error reading processed filenames from Excel '{excel_filename_param}': {e}")
-    return processed_files
-
-def find_unprocessed_images_for_resume(image_folder_param, processed_files_set):
-    unprocessed_images = []
-    for root, dirs, files in os.walk(image_folder_param):
-        for img_file_name in files:
-            if img_file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                if img_file_name not in processed_files_set:
-                    full_path = os.path.join(root, img_file_name)
-                    unprocessed_images.append(full_path)
-    return unprocessed_images
-
-def process_single_unprocessed_image_for_resume(loop, bot_instance, full_image_path: str):
-    logging.info(f"[RESUME] Processing unprocessed image: {full_image_path}")
-
-    filename_with_suffix = os.path.basename(full_image_path)
-    username_match = re.match(r'(.+)-log\d{4}-\d{2}-\d{2}-', filename_with_suffix)
-    username = username_match.group(1) if username_match else "unknown_user"
-    
-    bot_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    extracted_image_timestamp = None
-    try:
-        extracted_image_timestamp = extract_timestamp_from_image_ocr(full_image_path)
-
-        if extracted_image_timestamp:
-            logging.info(f"[RESUME] 📸 Extracted Timestamp from image: {extracted_image_timestamp}")
-        else:
-            logging.warning(f"[RESUME] ⚠️ Could not extract timestamp from image: {filename_with_suffix}. Logging to SQLite.")
-            insert_missed_timestamp_record(filename_with_suffix, bot_timestamp)
-
-    except Exception as e:
-        logging.error(f"[RESUME] 🔥 Error during image OCR for '{filename_with_suffix}': {e}")
-    
-    try:
-        append_to_excel(username, bot_timestamp, filename_with_suffix,
-                        extracted_image_timestamp.strftime("%Y-%m-%d %H:%M:%S") if extracted_image_timestamp else "N/A")
-        logging.info(f"[RESUME] ✅ Inserted record for '{filename_with_suffix}' into Excel.")
-    except Exception as e:
-        logging.error(f"[RESUME] ❌ Excel write error for '{filename_with_suffix}': {e}")
-        
-    logging.info(f"[RESUME] Finished processing for {filename_with_suffix}")
-
-def resume_unprocessed_tasks_init_main(bot_instance_param):
-    logging.info("Checking for any unprocessed images from previous sessions...")
-    
-    processed_files_set = get_processed_image_filenames_for_resume(EXCEL_FILENAME)
-    
-    unprocessed_images = find_unprocessed_images_for_resume(IMAGE_FOLDER, processed_files_set)
-    
-    if unprocessed_images:
-        logging.info(f"Found {len(unprocessed_images)} unprocessed images. Starting background processing...")
-        current_loop = asyncio.get_event_loop()
-        for img_path in unprocessed_images:
-            thread = threading.Thread(target=process_single_unprocessed_image_for_resume,
-                                      args=(current_loop, bot_instance_param, img_path))
-            thread.start()
-    else:
-        logging.info("No unprocessed images found. All tasks are up-to-date.")
 
 
 if __name__ == "__main__":
     logging.info("Starting Telegram Bot...")
     
-    initialize_directories()
-    initialize_excel()
-    initialize_sqlite_db()
-
+    # --- Initializations ---
+    initialize_directories() # 
+    initialize_sqlite_db() # Initialize SQLite DB
+    
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
     # --- Resume Unprocessed Tasks ---
-    # ส่ง application.bot ไปยังฟังก์ชัน resume
-    resume_unprocessed_tasks_init_main(application.bot) 
+    resume_manager.resume_unprocessed_tasks_init(
+        bot_instance_param=application.bot,
+        image_folder_param=IMAGE_FOLDER,
+        excel_base_folder_param=EXCEL_BASE_FOLDER,
+        
+        extract_timestamp_func=extract_timestamp_from_image_ocr, # OCR function (จะคืนค่า None เพราะ OCR ถูกปิด)
+        insert_missed_record_func=insert_missed_timestamp_record,
+        # save_data_to_both_formats_func เปลี่ยนเป็น append_to_local_excel
+        save_data_to_local_excel_func=excel_manager.append_to_local_excel
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
